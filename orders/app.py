@@ -1,4 +1,4 @@
-"""Orders: быстрый приём заказов и фоновая обработка отказов Payment."""
+"""Orders: заказы, надёжная публикация событий и бонусы за доставку."""
 
 import asyncio
 import logging
@@ -6,6 +6,7 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
+from typing import Literal
 
 import httpx
 import psycopg
@@ -20,6 +21,7 @@ from pydantic import BaseModel, Field
 DATABASE_URL = os.environ["DATABASE_URL"]
 PAYMENT_URL = os.environ["PAYMENT_URL"].rstrip("/")
 INVENTORY_URL = os.environ["INVENTORY_URL"].rstrip("/")
+EVENTS_URL = os.environ["EVENTS_URL"].rstrip("/")
 WORKERS = 4
 
 logging.basicConfig(level=logging.INFO)
@@ -39,6 +41,19 @@ CREATE TABLE IF NOT EXISTS orders (
 );
 CREATE INDEX IF NOT EXISTS orders_pending
     ON orders (next_attempt_at) WHERE status = 'pending';
+CREATE TABLE IF NOT EXISTS outbox (
+    id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL UNIQUE REFERENCES orders(id),
+    published BOOLEAN NOT NULL DEFAULT FALSE
+);
+CREATE INDEX IF NOT EXISTS outbox_pending ON outbox (id) WHERE NOT published;
+CREATE TABLE IF NOT EXISTS processed_events (
+    id TEXT PRIMARY KEY
+);
+CREATE TABLE IF NOT EXISTS bonuses (
+    user_id TEXT PRIMARY KEY,
+    points BIGINT NOT NULL
+);
 """
 
 
@@ -57,6 +72,13 @@ class Item(BaseModel):
 class OrderRequest(BaseModel):
     user_id: str = Field(min_length=1, strict=True)
     items: list[Item] = Field(min_length=1)
+
+
+class DeliveryEvent(BaseModel):
+    id: str = Field(min_length=1, strict=True)
+    type: Literal["delivery.confirmed"]
+    user_id: str = Field(min_length=1, strict=True)
+    bonus_points: int = Field(ge=1, le=2**63 - 1, strict=True)
 
 
 class CircuitBreaker:
@@ -127,6 +149,18 @@ async def charge(client, breaker, order):
     return None
 
 
+async def mark_paid(conn, order_id):
+    # Статус и обязанность опубликовать событие сохраняются вместе.
+    # При падении либо зафиксируются обе записи, либо ни одна.
+    async with conn.transaction():
+        await conn.execute("UPDATE orders SET status = 'paid' WHERE id = %s", (order_id,))
+        await conn.execute(
+            "INSERT INTO outbox (id, order_id) VALUES (%s, %s) "
+            "ON CONFLICT (order_id) DO NOTHING",
+            (str(uuid.uuid4()), order_id),
+        )
+
+
 async def process_order(client, breaker, order):
     async with await db() as conn:
         if order["step"] == "reserve":
@@ -148,7 +182,7 @@ async def process_order(client, breaker, order):
             if result is None:
                 return
             if result == "paid":
-                await conn.execute("UPDATE orders SET status = 'paid' WHERE id = %s", (order["id"],))
+                await mark_paid(conn, order["id"])
                 return
             # Запоминаем отказ до снятия резерва: если DELETE не удался,
             # следующая попытка только снимет резерв, не вызывая оплату.
@@ -197,6 +231,41 @@ async def worker(client, breaker, selection_lock, active):
         await asyncio.sleep(0.1)
 
 
+async def publish_event(client, event):
+    try:
+        response = await client.post(f"{EVENTS_URL}/events", json={
+            "id": event["id"], "type": "order.paid", "order_id": event["order_id"],
+        })
+        if response.status_code == 202:
+            return True
+        log.warning("Событие %s: шина ответила %s", event["id"], response.status_code)
+    except httpx.HTTPError as exc:
+        log.warning("Событие %s: нет ответа шины (%s)", event["id"], exc)
+    return False
+
+
+async def publisher(client):
+    # Отправитель один, поэтому захватывать строки outbox не требуется.
+    while True:
+        try:
+            async with await db() as conn:
+                cursor = await conn.execute(
+                    "SELECT id, order_id FROM outbox WHERE NOT published ORDER BY id LIMIT 1",
+                )
+                event = await cursor.fetchone()
+                if event:
+                    if await publish_event(client, event):
+                        # Если ответ или эта запись потерялись, отправим ещё
+                        # раз. id события берётся из базы и не меняется.
+                        await conn.execute("UPDATE outbox SET published = TRUE WHERE id = %s", (event["id"],))
+                    else:
+                        await asyncio.sleep(2)
+        except Exception:
+            log.exception("Ошибка отправки события")
+            await asyncio.sleep(2)
+        await asyncio.sleep(0.1)
+
+
 @asynccontextmanager
 async def lifespan(app):
     async with await db() as conn:
@@ -209,6 +278,7 @@ async def lifespan(app):
             asyncio.create_task(worker(client, breaker, selection_lock, active))
             for _ in range(WORKERS)
         ]
+        tasks.append(asyncio.create_task(publisher(client)))
         try:
             yield
         finally:
@@ -255,6 +325,34 @@ async def get_order(order_id: str):
     if order is None:
         raise HTTPException(404, "Заказ не найден")
     return order
+
+
+@app.post("/webhooks/delivery")
+async def delivery_confirmed(event: DeliveryEvent):
+    async with await db() as conn:
+        # Уникальный id защищает и от последовательных, и от одновременных
+        # копий. Отметка о событии и начисление фиксируются одной транзакцией.
+        async with conn.transaction():
+            cursor = await conn.execute(
+                "INSERT INTO processed_events (id) VALUES (%s) ON CONFLICT DO NOTHING RETURNING id",
+                (event.id,),
+            )
+            if await cursor.fetchone():
+                await conn.execute(
+                    "INSERT INTO bonuses (user_id, points) VALUES (%s, %s) "
+                    "ON CONFLICT (user_id) DO UPDATE SET points = bonuses.points + EXCLUDED.points",
+                    (event.user_id, event.bonus_points),
+                )
+    # Ответ только после commit. Если он потеряется, повтор уже не начислит бонусы.
+    return {"status": "ok"}
+
+
+@app.get("/users/{user_id}/bonus")
+async def get_bonus(user_id: str):
+    async with await db() as conn:
+        cursor = await conn.execute("SELECT points FROM bonuses WHERE user_id = %s", (user_id,))
+        row = await cursor.fetchone()
+    return {"points": row["points"] if row else 0}
 
 
 if __name__ == "__main__":
